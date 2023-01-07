@@ -1,0 +1,9 @@
+version: "3.6"
+services:
+  nginx:
+    volumes:
+      - ./config/nginx/sites-prod:/etc/nginx/sites-enabled
+      - /etc/letsencrypt:/etc/letsencrypt
+
+  nuxt-app:
+    command: sh -c "node .output/server/index.mjs"

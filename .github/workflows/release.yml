@@ -1,0 +1,196 @@
+name: Deploy release candidate to int
+
+on:
+  push:
+    tags:
+      - rc*
+
+jobs:
+  test-application:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [ 16.14.2 ]
+    env:
+      working-directory: ./nuxt-app
+    steps:
+      - uses: actions/checkout@v3
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: ./nuxt-app/package-lock.json
+      - run: npm ci
+        working-directory: ${{env.working-directory}}
+      - run: npm run build
+        working-directory: ${{env.working-directory}}
+      - run: npm test
+        working-directory: ${{env.working-directory}}
+
+  create-deployment-artifacts:
+    needs: test-application
+    name: Create Deployment Artefacts
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [ 16.14.2 ]
+    env:
+      working-directory: ./nuxt-app
+    outputs:
+      deployment-matrix: ${{ steps.export-deployment-matrix.outputs.deployment-matrix }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: ./nuxt-app/package-lock.json
+      - run: npm ci
+        working-directory: ${{env.working-directory}}
+      - run: npm run build
+        working-directory: ${{env.working-directory}}
+      - run: npm test
+        working-directory: ${{env.working-directory}}
+      - name: Create deployment artifact
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: tar -czf "${GITHUB_SHA}".tar.gz  --exclude=node_modules --exclude=tests * .??*
+
+      - name: Store artifact for distribution
+        uses: actions/upload-artifact@v2
+        with:
+          name: app-build
+          path: ${{ github.sha }}.tar.gz
+
+      - name: Export deployment matrix
+        id: export-deployment-matrix
+        run: |
+          JSON="$(cat ./config/deployment/pre-release-int-config.json)"
+          JSON="${JSON//'%'/'%25'}"
+          JSON="${JSON//$'\n'/'%0A'}"
+          JSON="${JSON//$'\r'/'%0D'}"
+          echo "::set-output name=deployment-matrix::$JSON"
+
+  prepare-release-on-servers:
+    needs: create-deployment-artifacts
+    name: "${{ matrix.server.name }}: Prepare release"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        server: ${{ fromJson(needs.create-deployment-artifacts.outputs.deployment-matrix) }}
+    steps:
+      - uses: actions/download-artifact@v2
+        with:
+          name: app-build
+      - name: Upload
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ matrix.server.ip }}
+          port: ${{ matrix.server.port }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY_INT }}
+          source: ${{ github.sha }}.tar.gz
+          target: ${{ matrix.server.path }}/artifacts
+
+      - name: Extract archive and create directories
+        uses: appleboy/ssh-action@master
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY_INT }}
+          port: ${{ matrix.server.port }}
+          envs: GITHUB_SHA
+          script: |
+            mkdir -p "${{ matrix.server.path }}/releases/${GITHUB_SHA}"
+            tar xzf ${{ matrix.server.path }}/artifacts/${GITHUB_SHA}.tar.gz -C "${{ matrix.server.path }}/releases/${GITHUB_SHA}"
+            rm -rf ${{ matrix.server.path }}/releases/${GITHUB_SHA}/storage
+
+  run-before-hooks:
+    name: "${{ matrix.server.name }}: Before hook"
+    runs-on: ubuntu-latest
+    needs: [ create-deployment-artifacts, prepare-release-on-servers ]
+    strategy:
+      matrix:
+        server: ${{ fromJson(needs.create-deployment-artifacts.outputs.deployment-matrix) }}
+    steps:
+      - name: Run before hooks
+        uses: appleboy/ssh-action@master
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_PATH: ${{ matrix.server.path }}/releases/${{ github.sha }}
+          ACTIVE_RELEASE_PATH: ${{ matrix.server.path }}/current
+          STORAGE_PATH: ${{ matrix.server.path }}/storage
+          BASE_PATH: ${{ matrix.server.path }}
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY_INT }}
+          port: ${{ matrix.server.port }}
+          envs: GITHUB_SHA,RELEASE_PATH,ACTIVE_RELEASE_PATH,STORAGE_PATH,BASE_PATH
+          script: |
+            ${{ matrix.server.beforeHooks }}
+
+
+  activate-release:
+    name: "${{ matrix.server.name }}: Activate release"
+    runs-on: ubuntu-latest
+    needs: [ create-deployment-artifacts, prepare-release-on-servers, run-before-hooks ]
+    strategy:
+      matrix:
+        server: ${{ fromJson(needs.create-deployment-artifacts.outputs.deployment-matrix) }}
+    steps:
+      - name: Activate release
+        uses: appleboy/ssh-action@master
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          RELEASE_PATH: ${{ matrix.server.path }}/releases/${{ github.sha }}
+          ACTIVE_RELEASE_PATH: ${{ matrix.server.path }}/current
+          STORAGE_PATH: ${{ matrix.server.path }}/storage
+          BASE_PATH: ${{ matrix.server.path }}
+          PLATFORM_PROD_ENV: ${{ secrets.PLATFORM_PROD_ENV }}
+          ROOT_PROD_ENV: ${{ secrets.ROOT_PROD_ENV }}
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY_INT }}
+          port: ${{ matrix.server.port }}
+          envs: GITHUB_SHA,RELEASE_PATH,ACTIVE_RELEASE_PATH,STORAGE_PATH,BASE_PATH,ENV_PATH,PLATFORM_PROD_ENV,ROOT_PROD_ENV,GITHUB_REF
+          script: |
+            cp "${RELEASE_PATH}/apps/nuxt-app/.env.prod"  "${RELEASE_PATH}/apps/nuxt-app/.env"
+            echo "RELEASE_VERSION=${GITHUB_REF}" >> "${RELEASE_PATH}/apps/nuxt-app/.env"
+            cp "${RELEASE_PATH}/.env.prod" "${RELEASE_PATH}/.env"
+            ln -s -n -f $RELEASE_PATH $ACTIVE_RELEASE_PATH
+            systemctl restart fullstackjack
+            chown -R www-data:www-data ${RELEASE_PATH}
+
+  clean-up:
+    name: "${{ matrix.server.name }}: Clean up"
+    runs-on: ubuntu-latest
+    needs: [ create-deployment-artifacts, prepare-release-on-servers, run-before-hooks, activate-release ]
+    strategy:
+      matrix:
+        server: ${{ fromJson(needs.create-deployment-artifacts.outputs.deployment-matrix) }}
+    steps:
+      - name: Run after hooks
+        uses: appleboy/ssh-action@master
+        env:
+          RELEASES_PATH: ${{ matrix.server.path }}/releases
+          ARTIFACTS_PATH: ${{ matrix.server.path }}/artifacts
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY_INT }}
+          port: ${{ matrix.server.port }}
+          envs: RELEASES_PATH
+          script: |
+            cd $RELEASES_PATH && ls -t -1 | tail -n +4 | xargs rm -rf
+            cd $ARTIFACTS_PATH && echo "now cleaning . . . ." && pwd && ls && echo "fies to clean . . . ." && ls -t -1 && ls -t -1 | tail -n +4 | xargs rm -rf
+      # delete-artifact
+      - uses: geekyeggo/delete-artifact@v1
+        with:
+          name: create-deployment-artifacts

@@ -1,0 +1,21 @@
+version: "3.6"
+services:
+  nginx:
+    volumes:
+      - ./config/ssl:/etc/ssl:ro
+      - ./config/nginx/sites-dev:/etc/nginx/sites-enabled
+
+  avantage:
+    command: sh -c "yarn && yarn dev"
+
+  mysql:
+    platform: linux/amd64
+    image: mariadb:10.4.25  
+
+  mailhog:
+    container_name: mailhog_avantage
+    image: mailhog/mailhog
+    restart: always
+    ports:
+      - "1025:1025"
+      - "8025:8025"

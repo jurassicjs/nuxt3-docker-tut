@@ -1,0 +1,47 @@
+version: "3.6"
+services:
+  nginx:
+    image: nginx:1.15
+    working_dir: /var/www/html
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./avantage:/var/www/html/avantage
+      - ./config/nginx/includes:/etc/nginx/includes:ro
+      - ./config/nginx/auth:/etc/nginx/auth
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf
+
+  mysql:
+    image: mysql:5.7
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_DATABASE=${DB_NAME}
+      - MYSQL_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+      - MYSQL_USER=${DB_USERNAME}
+      - MYSQL_PASSWORD=${DB_PASSWORD}
+    volumes:
+      - mysqldata:/var/lib/mysql
+
+  avantage:
+    ports:
+      - "24678:24678"
+      - "9222:9222"
+      - "5454:5555"
+    user: node
+    build:
+      dockerfile: Dockerfile
+      context: ./config/avantage
+    working_dir: /var/www/html/avantage
+    volumes:
+      - ./avantage:/var/www/html/avantage
+    command: sh -c "node .output/server/index.mjs"
+    stdin_open: true
+    tty: true
+    networks:
+      - default
+
+volumes:
+  mysqldata:
+    driver: local
